@@ -10,7 +10,16 @@ const int BTN_ZERO_PIN = A6;   // zero both angles
 const int BTN_LOG_PIN  = A7;   // start/stop logging
 const int SENSOR2_SDA = D4;
 const int SENSOR2_SCL = D5;
-const int relayPin = D6; // FES control 
+const int relayPin = D2; // FES control
+
+// ---------- D2 output ----------
+const float OUT_MIN_DEG = 45.0f;
+const float OUT_MAX_DEG = 90.0f;
+const uint32_t OUT_PULSE_MS = 2000;
+
+bool inRange = false;
+bool outActive = false;
+uint32_t outPulseStartMs = 0;
 
 // AS5600 I2C address and angle register
 const uint8_t AS5600_ADDR = 0x36;
@@ -95,7 +104,7 @@ bool startLogging() {
     return false;
   }
 
-  logFile.println("time_us,raw1,angle1_deg,raw2,angle2_deg,fp_mv,fp_trigger");
+  logFile.println("time_us,raw1,angle1_deg,raw2,angle2_deg,fp_mv,fp_trigger,d2_out");
   logFile.flush();
 
   bufferUsed = 0;
@@ -176,6 +185,14 @@ void handleSerial() {
   handleButtons();
 }
 
+// Turns the output off once the pulse time is up
+void updateOutput() {
+  if (outActive && millis() - outPulseStartMs >= OUT_PULSE_MS) {
+    digitalWrite(relayPin, LOW);
+    outActive = false;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -184,6 +201,8 @@ void setup() {
   pinMode(BTN_ZERO_PIN, INPUT_PULLUP);
   pinMode(BTN_LOG_PIN, INPUT_PULLUP);
   pinMode(FP_PIN, INPUT);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);
 
   // Sensor 1: default I2C bus (A4 = SDA, A5 = SCL)
   Wire.begin();
@@ -200,8 +219,7 @@ void setup() {
   Wire1.beginTransmission(AS5600_ADDR);
   if (Wire1.endTransmission() != 0) halt("AS5600 #2 (D4/D5) not detected!");
 
-  pinMode(relayPin, OUTPUT);
-  digitalWrite(relayPin, LOW);
+ 
  
   Serial.begin(115200);
  
@@ -216,6 +234,7 @@ void setup() {
 
 void loop() {
   handleSerial();
+  updateOutput();
 
   uint32_t now = micros();
   if ((int32_t)(now - nextSampleUs) < 0) return;
@@ -238,6 +257,15 @@ void loop() {
   float angle1 = ((raw1 - zeroOffset1) & 0x0FFF) * (360.0f / 4096.0f);
   float angle2 = ((raw2 - zeroOffset2) & 0x0FFF) * (360.0f / 4096.0f);
 
+    // D2 pulse when sensor 2 enters 90-180 degrees
+  bool nowInRange = (angle2 >= OUT_MIN_DEG && angle2 <= OUT_MAX_DEG);
+  if (nowInRange && !inRange) {      // just entered the range
+    digitalWrite(relayPin, HIGH);
+    outActive = true;
+    outPulseStartMs = millis();
+  }
+  inRange = nowInRange;
+
   // Force plate trigger with hysteresis
   fpMv = analogReadMilliVolts(FP_PIN);
   if (!fpTrigger && fpMv >= FP_ON_MV) {
@@ -249,9 +277,10 @@ void loop() {
   // Print to the serial monitor every 0.5 s
   if (now - lastPrintUs >= PRINT_INTERVAL_US) {
     lastPrintUs = now;
-    Serial.printf("%s angle1=%.2f  angle2=%.2f deg  FP Trigger: %s",
-                  logging ? "[LOG] " : "[idle]", angle1, angle2,
-                  fpTrigger ? "True" : "False");
+      Serial.printf("%s angle1=%.2f  angle2=%.2f deg  FP Trigger: %s  FES Output: %s",
+                logging ? "[LOG] " : "[idle]", angle1, angle2,
+                fpTrigger ? "True" : "False",
+                outActive ? "True" : "False");
     if (FP_SHOW_MV) Serial.printf("  (FP=%d mV)", fpMv);
     Serial.println();
   }
@@ -262,11 +291,12 @@ void loop() {
   uint32_t timestamp = micros() - logStartUs;
 
   char line[96];
-  int len = snprintf(line, sizeof(line), "%lu,%u,%.3f,%u,%.3f,%d,%d\n",
+    int len = snprintf(line, sizeof(line), "%lu,%u,%.3f,%u,%.3f,%d,%d,%d\n",
                      (unsigned long)timestamp,
                      (unsigned)raw1, angle1,
                      (unsigned)raw2, angle2,
-                     fpMv, fpTrigger ? 1 : 0);
+                     fpMv, fpTrigger ? 1 : 0,
+                     outActive ? 1 : 0);
   if (len <= 0 || len >= (int)sizeof(line)) return;
 
   if (bufferUsed + len >= sizeof(logBuffer)) {
